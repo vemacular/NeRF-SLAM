@@ -259,7 +259,7 @@ class RaftVisualFrontend(VisualFrontend):
                 cv2.imshow(f'Img{i} normalized', img.permute(1,2,0).cpu().numpy())
 
         if self.last_k is None:
-            ic(k)
+            #ic(k)
             assert k == 0
             assert self.kf_idx == 0
             assert self.last_kf_idx == 0

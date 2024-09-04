@@ -57,6 +57,9 @@ def parse_args():
 
     parser.add_argument("--eval", action="store_true", help="Evaluate method.")
 
+    parser.add_argument("--vis_nerf", action="store_true", help="show the selcted image of keyframe")
+    parser.add_argument("--eval_img_savepath",default='../Eval/',help="path to save render image")
+
     return parser.parse_args()
 
 def run(args):
@@ -76,13 +79,13 @@ def run(args):
     else:
         from torch.multiprocessing import Queue
 
-    # Create the Queue object
+    # Create the Queue object  多进程之间共享data
     data_for_viz_output_queue = Queue()
-    data_for_fusion_output_queue = Queue()
-    data_output_queue = Queue()
-    slam_output_queue_for_fusion = Queue()
+    data_for_fusion_output_queue = Queue() # dataset(input frame) -> fusion
+    data_output_queue = Queue()  # dataset(input frame) -> slam : frame come from dataset save in this, and then slam get frame from this
+    slam_output_queue_for_fusion = Queue()  # slam -> fusion
     slam_output_queue_for_o3d = Queue()
-    fusion_output_queue_for_gui = Queue()
+    fusion_output_queue_for_gui = Queue()  # 
     gui_output_queue_for_fusion = Queue()
 
     # Create Dataset provider
@@ -103,11 +106,11 @@ def run(args):
         fusion_module = FusionModule(args.fusion, args, device=cuda_fusion)
         if slam:
             slam_module.register_output_queue(slam_output_queue_for_fusion)
-            fusion_module.register_input_queue("slam", slam_output_queue_for_fusion)
+            fusion_module.register_input_queue("slam", slam_output_queue_for_fusion)  # slam的输出 -> fusion的输入
         
         if (args.fusion == 'nerf' and not slam) or (args.fusion != 'nerf' and args.eval):
             # Only used for evaluation, or in case we do not use slam (for nerf)
-            data_provider_module.register_output_queue(data_for_fusion_output_queue)
+            data_provider_module.register_output_queue(data_for_fusion_output_queue) # 
             fusion_module.register_input_queue("data", data_for_fusion_output_queue)
 
 

@@ -29,8 +29,16 @@ class NeRFDataset(Dataset):
         resolution = Resolution(w, h)
         pinhole0 = PinholeCameraModel(fx, fy, cx, cy)
         distortion0 = RadTanDistortionModel(0, 0, 0, 0)
+        if 'aabb' in self.json:
+            aabb = self.json["aabb"]
+        else:
+            # consider calculate aabb from json or use default
+            from datasets.calculate_aabb import cal_aabb_from_transform
+            aabb = cal_aabb_from_transform(os.path.join(self.dataset_dir,"transforms.json"))
+            aabb = aabb.to_list()
+            
+            aabb = [[-10,-10,-10],[10,10,10]]
 
-        aabb = self.json["aabb"]
         depth_scale = self.json["integer_depth_scale"] if "integer_depth_scale" in self.json else 1.0
 
         return CameraCalibration(body_T_cam0, pinhole0, distortion0, rate_hz, resolution, aabb, depth_scale)
@@ -42,10 +50,10 @@ class NeRFDataset(Dataset):
         self.calib = self.get_cam_calib()
 
         self.resize_images = False
-        if self.calib.resolution.total() > 640*640:
+        if self.calib.resolution.total() > 300*300:
             self.resize_images = True
             # TODO(Toni): keep aspect ratio, and resize max res to 640
-            self.output_image_size = [341, 640] # h, w 
+            self.output_image_size = [400,500]#[341, 640] # h, w 
 
         self.image_paths = []
         self.depth_paths = []
@@ -56,7 +64,7 @@ class NeRFDataset(Dataset):
             total_output_pixels = (self.output_image_size[0] * self.output_image_size[1])
             self.h1 = int(h0 * np.sqrt(total_output_pixels / (h0 * w0)))
             self.w1 = int(w0 * np.sqrt(total_output_pixels / (h0 * w0)))
-            self.h1 = self.h1 - self.h1 % 8
+            self.h1 = self.h1 - self.h1 % 8  # maybe used for downsample later
             self.w1 = self.w1 - self.w1 % 8
             self.calib.camera_model.scale_intrinsics(self.w1 / w0, self.h1 / h0)
             self.calib.resolution = Resolution(self.w1, self.h1)
@@ -91,7 +99,10 @@ class NeRFDataset(Dataset):
             sorted(self.image_paths, key=lambda path: int(os.path.splitext(os.path.basename(path[1]))[0]))
         else:
             # name is "frame000000.jpg" for Replica
-            sorted(self.image_paths, key=lambda path: int(os.path.splitext(os.path.basename(path[1]))[0][5:]))
+            if '_' in os.path.splitext(os.path.basename(self.image_paths[0][1]))[0]:
+                sorted(self.image_paths,key = lambda path: int(os.path.splitext(os.path.basename(path[1]))[0][6:]))
+            else:
+                sorted(self.image_paths, key=lambda path: int(os.path.splitext(os.path.basename(path[1]))[0][5:]))
 
         # Store the first pose, used as prior and initial state in SLAM.
         self.args.world_T_imu_t0 = self.w2c[0]
@@ -122,7 +133,7 @@ class NeRFDataset(Dataset):
             if depth_path:
                 depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)[..., None] # H, W, C=1
             else:
-                depth = (-1 * np.ones_like(image[:, :, 0])).astype(np.uint16) # invalid depth
+                depth = (-1 * np.ones_like(image[:, :, 0])).astype(np.uint16)[...,None] # invalid depth
 
             if self.resize_images:
                 w1, h1 = self.w1, self.h1

@@ -5,10 +5,13 @@ from lietorch import SE3
 
 import numpy as np
 import cv2
+from tqdm import tqdm
 
 from icecream import ic
 
 from utils.flow_viz import *
+from utils.utils import srgb_to_linear, linear_to_srgb
+from pathlib import Path
 
 import os
 import sys
@@ -34,7 +37,12 @@ class NerfFusion:
         self.args = args
         self.device = device
 
-        self.viz = False
+        self.viz = args.vis_nerf
+        self.render_image_savepath = args.eval_img_savepath
+        dataset_name= os.path.basename(args.dataset_dir)
+        if os.path.basename(self.render_image_savepath) != dataset_name:
+            self.render_image_savepath = os.path.join(self.render_image_savepath,dataset_name)
+        
 
         # self.render_path_i = 0
         # import json
@@ -71,7 +79,7 @@ class NerfFusion:
         render_aabb = ngp.BoundingBox(np.array([-np.inf, -np.inf, -np.inf]), np.array([np.inf, np.inf, np.inf])) # a no confundir amb self.ngp.aabb/raw_aabb/render_aabb
         self.ngp.create_empty_nerf_dataset(n_images, nerf_scale, offset, aabb_scale, render_aabb)
 
-        self.ngp.nerf.training.n_images_for_training = 0;
+        self.ngp.nerf.training.n_images_for_training = 0
 
         if args.gui:
             # Pick a sensible GUI resolution depending on arguments.
@@ -85,7 +93,7 @@ class NerfFusion:
             # Gui params:
             self.ngp.display_gui = True
             self.ngp.nerf.visualize_cameras = True
-            self.ngp.visualize_unit_cube = False
+            self.ngp.visualize_unit_cube = True
 
         self.ngp.reload_network_from_file(network)
 
@@ -111,12 +119,15 @@ class NerfFusion:
         self.annealing_rate = 0.95
 
         self.evaluate = args.eval
-        self.eval_every_iters = 200
+        self.eval_every_iters = 1000
         if self.evaluate:
             self.df = pandas.DataFrame(columns=['Iter', 'Dt','PSNR', 'L1', 'count'])
 
         # Fit vol once to init gui
         self.fit_volume_once()
+        self.tqdm = tqdm(total=self.stop_iters)
+        if self.evaluate:
+            os.makedirs(self.render_image_savepath,exist_ok=True)
 
     def process_data(self, packet):
         # GROUND_TRUTH Fitting
@@ -148,7 +159,7 @@ class NerfFusion:
         # Slam output is None, just fit for some iters
         slam_packet = packet[1]
         if slam_packet is None:
-            print("Fusion packet from SLAM module is None...")
+            #print("Fusion packet from SLAM module is None...")
             return True
 
         if slam_packet["is_last_frame"]:
@@ -167,7 +178,7 @@ class NerfFusion:
         scale, offset = get_scale_and_offset(calib.aabb) # if we happen to change aabb, we are screwed...
         gt_depth_scale = calib.depth_scale
         scale = 1.0 # We manually set the scale to 1.0 bcs the automatic get_scale_and_offset sets the scale too small for high-quality recons.
-        offset = np.array([0.0, 0.0, 0.0])
+        offset = np.array([0.0, 0.0, 0.0])  # forbidden the aabb in the transforms.json
 
         # Mask out depths that have too much uncertainty
         if self.mask_type == "ours":
@@ -250,7 +261,7 @@ class NerfFusion:
                 self.fit_volume()
         else:
             #print("No packet received in fusion module.")
-            self.fit_volume()
+            self.fit_volume()  # data_packet is False means no new slam packet input
 
         # Set the gui to a given pose, and follow the gt pose, but modulate the speed somehow...
         # a) allow to provide a pose (from gt)
@@ -282,10 +293,12 @@ class NerfFusion:
         principal_point = intrinsics[2:]
 
         # TODO: we need to restore the self.ref_frames[frame_id] = [image, gt, etc] for evaluation....
+        for i,id in enumerate(frame_ids):
+            self.ref_frames[id.item()] = [images[i], depths[i], gt_depths[i], depths_cov[i]]
         self.ngp.nerf.training.update_training_images(list(frame_ids),
-                                                      list(poses[:, :3, :4]), 
-                                                      list(images), 
-                                                      list(depths), 
+                                                      list(poses[:, :3, :4]),   # 估计的pose
+                                                      list(images),   # gt image
+                                                      list(depths),  # 估计的depth
                                                       list(depths_cov), resolution, principal_point, focal_length, depth_scale, depth_cov_scale)
 
         # On the first frame, set the viewpoint
@@ -295,6 +308,8 @@ class NerfFusion:
 
     def fit_volume(self):
         #print(f"Fitting volume for {self.iters} iters")
+        self.tqdm.update(self.iters)
+        self.tqdm.set_description(f"Training ngp model {self.iters} iters")
         self.fps = 30
         for _ in range(self.iters):
             self.fit_volume_once()
@@ -404,13 +419,19 @@ class NerfFusion:
         self.ngp.nerf.rendering_min_transmittance = 1e-4
         self.ngp.shall_train = False
 
-        stride = 2
+        stride = 1
 
         # Evaluate
         count = 0
         total_l1 = 0
         total_psnr = 0
+        print("len(ref_frame)", len(self.ref_frames))
+        print("n_images_for_training: ", self.ngp.nerf.training.n_images_for_training)
+        render_img_savepath = os.path.join(self.render_image_savepath,str(self.total_iters))
+        os.makedirs(render_img_savepath,exist_ok=True)
+        render_img_savepath = Path(render_img_savepath)
         assert(len(self.ref_frames) == self.ngp.nerf.training.n_images_for_training)
+        print("every image psnr:")
         for i in range(0, self.ngp.nerf.training.n_images_for_training, stride):
             # Use GT trajectory for evaluation to have consistent metrics.
             self.ngp.set_camera_to_training_view(i) 
@@ -419,6 +440,16 @@ class NerfFusion:
             self.ngp.render_mode = ngp.Shade
             ref_image = self.ref_frames[i][0]
             est_image = self.ngp.render(ref_image.shape[1], ref_image.shape[0], spp, linear, fps=fps)
+
+            # for save
+            ref_image_linear = linear_to_srgb(ref_image[:,:,0:3])
+            est_image_linear = linear_to_srgb(est_image[:,:,0:3])
+            ref_image_uchar = np.clip(ref_image_linear[:,:,:3]*255, 0,255).astype(np.uint8)
+            est_image_uchar = np.clip(est_image_linear[:,:,:3]*255,0,255).astype(np.uint8)
+            ref_image_uchar = np.flip(ref_image_uchar,axis=-1)
+            est_image_uchar = est_image_uchar[:,:,::-1]
+            cv2.imwrite(render_img_savepath / f"est_{i}.png", est_image_uchar)
+            cv2.imwrite(render_img_savepath / f"ref_{i}.png", ref_image_uchar)
 
             if self.viz:
                 cv2.imshow("Color Error", np.sum(ref_image - est_image, axis=-1))
@@ -432,6 +463,8 @@ class NerfFusion:
             # Calc metrics
             mse = float(compute_error(est_image, ref_image))
             psnr = mse2psnr(mse)
+            print("\033[" + "32m" + f"img_{i}:{psnr:.2f}",end='\t')
+            print("\033[" + "0m",end='')
             total_psnr += psnr
 
             # Calc L1 metrics
@@ -455,7 +488,7 @@ class NerfFusion:
                 viz_depth_map(torch.tensor(est_depth, dtype=torch.float32, device="cpu"), fix_range=False, name="Est Depth", colormap=cv2.COLORMAP_TURBO, invert=False)
 
             est_to_ref_depth_scale = ref_depth.mean() / est_depth.mean()
-            ic(est_to_ref_depth_scale)
+            #ic(est_to_ref_depth_scale)
             diff_depth_map = np.abs(est_to_ref_depth_scale * est_depth - ref_depth)
             diff_depth_map[diff_depth_map > 2.0] = 2.0 # Truncate outliers to 1m, otw biases metric, this can happen either bcs depth is not estimated or bcs gt depth is wrong. 
             if self.viz:

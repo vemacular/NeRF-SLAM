@@ -8,7 +8,7 @@ class SlamModule(MIMOPipelineModule):
         self.device = device
 
     def spin_once(self, input):
-        output = self.slam(input)
+        output = self.slam(input)  # not need pose and depth, just need image
         if not output or self.slam.stop_condition():
             super().shutdown_module()
         return output
