@@ -36,8 +36,9 @@ class NeRFDataset(Dataset):
             from datasets.calculate_aabb import cal_aabb_from_transform
             aabb = cal_aabb_from_transform(os.path.join(self.dataset_dir,"transforms.json"))
             aabb = aabb.to_list()
+            print("compute aabb from pose",aabb)
             
-            aabb = [[-10,-10,-10],[10,10,10]]
+            #aabb = [[-1,-1,-1],[1,1,1]]
 
         depth_scale = self.json["integer_depth_scale"] if "integer_depth_scale" in self.json else 1.0
 
@@ -50,10 +51,10 @@ class NeRFDataset(Dataset):
         self.calib = self.get_cam_calib()
 
         self.resize_images = False
-        if self.calib.resolution.total() > 300*300:
+        if self.calib.resolution.total() > 500*500:
             self.resize_images = True
             # TODO(Toni): keep aspect ratio, and resize max res to 640
-            self.output_image_size = [400,500]#[341, 640] # h, w 
+            self.output_image_size = [400,400]#[341, 640] # h, w 
 
         self.image_paths = []
         self.depth_paths = []
@@ -126,7 +127,7 @@ class NeRFDataset(Dataset):
             i, image_path = self.image_paths[k]
             depth_path = self.depth_paths[i] # index with i, bcs we sorted image_paths to have increasing timestamps.
             w2c = self.w2c[i]
-
+            print("input frame:",image_path)
             # Parse rgb/depth images
             image = cv2.imread(image_path) # H, W, C=4
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA) # Required for Nerf Fusion, perhaps we can put it in there

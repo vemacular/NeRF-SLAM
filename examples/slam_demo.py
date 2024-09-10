@@ -59,7 +59,8 @@ def parse_args():
 
     parser.add_argument("--vis_nerf", action="store_true", help="show the selcted image of keyframe")
     parser.add_argument("--eval_img_savepath",default='../Eval/',help="path to save render image")
-
+    parser.add_argument("--motion_threshold",default=2.4, type=float,help="the threshold of motion, big means select key frame much strict")
+    parser.add_argument("--aabb_scale",default=4, type=int)
     return parser.parse_args()
 
 def run(args):

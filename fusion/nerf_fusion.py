@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 
 import torch
+#from pytorch_msssim import SSIM
+#from skimage.metrics import structural_similarity
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
+
 from lietorch import SE3
 
 import numpy as np
@@ -56,6 +61,8 @@ class NerfFusion:
         #     w2c = np.linalg.inv(c2w)
         #     self.render_path += [w2c]
 
+        self.getlastframe = False
+        self.firstallbuffer = True
         self.iters = 1
         self.iters_if_none = 1
         self.total_iters = 0
@@ -73,10 +80,11 @@ class NerfFusion:
         self.ngp = ngp.Testbed(mode, 0) # NGP can only use device = 0
 
         n_images = args.buffer
-        aabb_scale = 4
+        aabb_scale = self.args.aabb_scale  # define how large the scene
         nerf_scale = 1.0 # Not needed unless you call self.ngp.load_training_data() or you render depths!
-        offset = np.array([np.inf, np.inf, np.inf]) # Not needed unless you call self.ngp.load_training_data()
-        render_aabb = ngp.BoundingBox(np.array([-np.inf, -np.inf, -np.inf]), np.array([np.inf, np.inf, np.inf])) # a no confundir amb self.ngp.aabb/raw_aabb/render_aabb
+        offset = np.array([0, 0, 0]) # Not needed unless you call self.ngp.load_training_data()
+        render_aabb = ngp.BoundingBox(np.array([-np.inf, -np.inf, -np.inf]), np.array([np.inf, np.inf, np.inf])) 
+        #render_aabb = ngp.BoundingBox(np.array([-np.inf, -np.inf, -np.inf]), np.array([np.inf, np.inf, np.inf])) # a no confundir amb self.ngp.aabb/raw_aabb/render_aabb
         self.ngp.create_empty_nerf_dataset(n_images, nerf_scale, offset, aabb_scale, render_aabb)
 
         self.ngp.nerf.training.n_images_for_training = 0
@@ -88,7 +96,7 @@ class NerfFusion:
             while sw*sh > 1920*1080*4:
                 sw = int(sw / 2)
                 sh = int(sh / 2)
-            self.ngp.init_window(640, 480, second_window=False)
+            self.ngp.init_window(1280, 960, second_window=False)
 
             # Gui params:
             self.ngp.display_gui = True
@@ -119,9 +127,9 @@ class NerfFusion:
         self.annealing_rate = 0.95
 
         self.evaluate = args.eval
-        self.eval_every_iters = 1000
+        self.eval_every_iters = 3000
         if self.evaluate:
-            self.df = pandas.DataFrame(columns=['Iter', 'Dt','PSNR', 'L1', 'count'])
+            self.df = pandas.DataFrame(columns=['Iter', 'Dt','PSNR', 'PSNR_sRGB', 'SSIM', 'LPIPS', 'depth-L1', 'camera-count'])
 
         # Fit vol once to init gui
         self.fit_volume_once()
@@ -153,7 +161,7 @@ class NerfFusion:
 
         # No slam output, just fit for some iters
         if not packet:
-            print("Missing fusion input packet from SLAM module...")
+            print("Missing fusion input packet from SLAM module..., perform mapping optimize")
             return True
 
         # Slam output is None, just fit for some iters
@@ -163,6 +171,7 @@ class NerfFusion:
             return True
 
         if slam_packet["is_last_frame"]:
+            print("#"*10,'lastframe come')
             return True
 
         # Get new data and fit volume
@@ -177,8 +186,8 @@ class NerfFusion:
         calib = calibs[0]
         scale, offset = get_scale_and_offset(calib.aabb) # if we happen to change aabb, we are screwed...
         gt_depth_scale = calib.depth_scale
-        scale = 1.0 # We manually set the scale to 1.0 bcs the automatic get_scale_and_offset sets the scale too small for high-quality recons.
-        offset = np.array([0.0, 0.0, 0.0])  # forbidden the aabb in the transforms.json
+        #scale = 1.0 # We manually set the scale to 1.0 bcs the automatic get_scale_and_offset sets the scale too small for high-quality recons.
+        #offset = np.array([0.0, 0.0, 0.0])  # forbidden the aabb in the transforms.json
 
         # Mask out depths that have too much uncertainty
         if self.mask_type == "ours":
@@ -274,6 +283,7 @@ class NerfFusion:
 
     def stop_condition(self):
         return self.total_iters > self.stop_iters if self.evaluate else False
+        #return False
 
     def send_data(self, batch):
         frame_ids       = batch["k"]
@@ -321,9 +331,19 @@ class NerfFusion:
         #print(f"Iter={self.total_iters}; Dt={dt}; Loss={self.ngp.loss}")
         if self.anneal and self.total_iters % self.anneal_every_iters == 0:
             self.ngp.nerf.training.depth_supervision_lambda *= self.annealing_rate
-        if self.evaluate and self.total_iters % self.eval_every_iters == 0:
+        if self.evaluate and self.total_iters>0 and self.total_iters % self.eval_every_iters == 0:
             print("Evaluate.")
             self.eval_gt_traj()
+        if self.getlastframe:
+            self.getlastframe = not self.getlastframe
+            self.eval_gt_traj()
+        if self.firstallbuffer and len(self.ref_frames) == self.args.buffer - 1:
+            self.firstallbuffer = False
+            self.eval_gt_traj()
+        if self.total_iters == self.stop_iters:
+            self.eval_gt_traj()
+            self.ngp.save_snapshot(self.render_image_savepath+"/model.msgpack",False)
+
         self.total_iters += 1
 
     def evaluate_depth(self):
@@ -425,6 +445,11 @@ class NerfFusion:
         count = 0
         total_l1 = 0
         total_psnr = 0
+        total_psnr_srgb = 0
+        total_ssim_srgb = 0
+        total_lpips_srgb = 0
+        ssim_metric = SSIM(data_range=1.0)
+        lpips_metric = LearnedPerceptualImagePatchSimilarity(normalize=True,net_type='vgg')
         print("len(ref_frame)", len(self.ref_frames))
         print("n_images_for_training: ", self.ngp.nerf.training.n_images_for_training)
         render_img_savepath = os.path.join(self.render_image_savepath,str(self.total_iters))
@@ -442,10 +467,10 @@ class NerfFusion:
             est_image = self.ngp.render(ref_image.shape[1], ref_image.shape[0], spp, linear, fps=fps)
 
             # for save
-            ref_image_linear = linear_to_srgb(ref_image[:,:,0:3])
-            est_image_linear = linear_to_srgb(est_image[:,:,0:3])
-            ref_image_uchar = np.clip(ref_image_linear[:,:,:3]*255, 0,255).astype(np.uint8)
-            est_image_uchar = np.clip(est_image_linear[:,:,:3]*255,0,255).astype(np.uint8)
+            ref_image_srgb = linear_to_srgb(ref_image[:,:,0:3])
+            est_image_srgb = linear_to_srgb(est_image[:,:,0:3])
+            ref_image_uchar = np.clip(ref_image_srgb[:,:,:3]*255, 0,255).astype(np.uint8)
+            est_image_uchar = np.clip(est_image_srgb[:,:,:3]*255,0,255).astype(np.uint8)
             ref_image_uchar = np.flip(ref_image_uchar,axis=-1)
             est_image_uchar = est_image_uchar[:,:,::-1]
             cv2.imwrite(render_img_savepath / f"est_{i}.png", est_image_uchar)
@@ -463,10 +488,18 @@ class NerfFusion:
             # Calc metrics
             mse = float(compute_error(est_image, ref_image))
             psnr = mse2psnr(mse)
-            print("\033[" + "32m" + f"img_{i}:{psnr:.2f}",end='\t')
+            psnr_srgb = float(compute_error(est_image_srgb,ref_image_srgb))
+            psnr_srgb = mse2psnr(psnr_srgb)
+            ssim = ssim_metric(torch.from_numpy(est_image_srgb).permute(2,0,1)[None,...],
+                               torch.from_numpy(ref_image_srgb).permute(2,0,1)[None,...])
+            lpips = lpips_metric(torch.from_numpy(est_image_srgb).permute(2,0,1)[None,...],
+                               torch.from_numpy(ref_image_srgb).permute(2,0,1)[None,...])
+            print("\033[" + "32m" + f"img_{i}:psnr-{psnr_srgb:.2f}, ssim-{ssim}, lpips-{lpips}",end='\t')
             print("\033[" + "0m",end='')
+            total_psnr_srgb += psnr_srgb
+            total_ssim_srgb += ssim
+            total_lpips_srgb += lpips
             total_psnr += psnr
-
             # Calc L1 metrics
             if self.viz:
                 frontend_depth = self.ref_frames[i][1].squeeze()
@@ -508,10 +541,13 @@ class NerfFusion:
             
         dt = self.ngp.elapsed_training_time
         psnr = total_psnr / (count or 1)
+        psnr_srgb = total_psnr_srgb / (count or 1)
+        ssim_srgb = total_ssim_srgb / (count or 1)
+        lpips_srgb = total_lpips_srgb / (count or 1)
         l1 = total_l1 / (count or 1)
-        print(f"Iter={self.total_iters}; Dt={dt}; PSNR={psnr}; L1={l1}; count={count}")
-        self.df.loc[len(self.df.index)] = [self.total_iters, dt, psnr, l1, count]
-        self.df.to_csv("results.csv")
+        print(f"Iter={self.total_iters}; Dt={dt}; PSNR={psnr};PSNR_srgb={psnr_srgb}; SSIM={ssim_srgb}; LPIPS={lpips_srgb} L1={l1}; count={count}")
+        self.df.loc[len(self.df.index)] = [self.total_iters, dt, psnr, psnr_srgb, ssim_srgb.item(), lpips_srgb.item(), l1, count]
+        self.df.to_csv(os.path.join(self.render_image_savepath,'results.csv'),float_format='%.4f')
 
         # Reset the state
         self.ngp.shall_train                 = tmp_shall_train

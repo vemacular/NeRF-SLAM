@@ -93,7 +93,7 @@ class RaftVisualFrontend(VisualFrontend):
         self.max_age = 25
         self.max_factors = 48
         self.kf_init_count = 8
-        self.motion_filter_thresh = 2.4 # To determine if we are moving, how much mean optical flow before considering new frame [px]
+        self.motion_filter_thresh = self.args.motion_threshold #2.4,设置太大，cuda会崩 To determine if we are moving, how much mean optical flow before considering new frame [px]
 
         self.viz = False # Whether to visualize the results
 
